@@ -11,6 +11,7 @@ from utils.loss import TripletLoss, RecognitionLoss
 from utils.dataset import ContrastDataset, PairDataset
 
 # 测试git
+# 配置参数
 class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     save_dir = 'models'
