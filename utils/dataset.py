@@ -82,46 +82,39 @@ class ContrastDataset(Dataset):
         return anchor_img, positive_img, negative_img, label
     
 class PairDataset(Data.Dataset):
-    def __init__(self, palm_dir, vein_dir, transform=None, is_train=True, train_ratio=1):
+    def __init__(self, palm_dir, vein_dir, transform=None, split='train'):
         self.palm_dir = palm_dir
         self.vein_dir = vein_dir
         self.transform = transform
-
-        palm_files = [f for f in os.listdir(palm_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg', '.JPG'))]
-        vein_files = [f for f in os.listdir(vein_dir) if f.lower().endswith(('.jpg', '.JPG'))]
-
-        # 简单配对，文件名格式：pid_...确保配对
-        pairs_by_pid = {}
-        for pf in palm_files:
-            parts = pf.split('_')
-            if len(parts) < 3: continue
-            pid = parts[0]
-            suf = '_'.join(parts[1:])
-            vf = next((v for v in vein_files if v.startswith(f"{pid}_") and v.endswith(suf)), None)
-            if vf:
-                pairs_by_pid.setdefault(pid, []).append((pf, vf))
-
-        self.pids = sorted(pairs_by_pid)
+        
+        # 获取所有人的ID（文件夹名）
+        self.pids = sorted([d for d in os.listdir(palm_dir) if os.path.isdir(os.path.join(palm_dir, d))])
         self.pid_to_label = {pid: i for i, pid in enumerate(self.pids)}
         self.num_classes = len(self.pids)
-
-        self.samples = []
+        
+        # 收集所有图像对
+        all_pairs = []
         for pid in self.pids:
-            pairs = pairs_by_pid[pid]
-            split = int(len(pairs) * train_ratio)
-            sub = pairs[:split] if is_train else pairs[split:]
-            label = self.pid_to_label[pid]
-            for pf, vf in sub:
-                self.samples.append((pf, vf, label))
-
-        # 验证集兜底
-        if not is_train:
-            have = set(lbl for _, _, lbl in self.samples)
-            for pid in self.pids:
-                lbl = self.pid_to_label[pid]
-                if lbl not in have and pairs_by_pid[pid]:
-                    pf, vf = pairs_by_pid[pid][-1]
-                    self.samples.append((pf, vf, lbl))
+            palm_path = os.path.join(palm_dir, pid)
+            vein_path = os.path.join(vein_dir, pid)
+            
+            if not os.path.exists(vein_path):
+                continue
+                
+            # 获取该人所有的图像文件
+            palm_files = sorted([f for f in os.listdir(palm_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+            vein_files = sorted([f for f in os.listdir(vein_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
+            
+            # 按文件名配对
+            for pf in palm_files:
+                if pf in vein_files:  # 如果文件名完全相同
+                    all_pairs.append((os.path.join(pid, pf), os.path.join(pid, pf), self.pid_to_label[pid]))
+        
+        # 对整个数据集进行划分
+        split_idx = int(len(all_pairs) * 0.8)
+        self.samples = all_pairs[:split_idx] if split == 'train' else all_pairs[split_idx:]
+        
+        print(f"{'训练' if split == 'train' else '验证'}集: {len(self.samples)}对图像，{self.num_classes}个类别")
 
     def __len__(self):
         return len(self.samples)
@@ -130,11 +123,14 @@ class PairDataset(Data.Dataset):
         pf, vf, label = self.samples[idx]
         palm_img = Image.open(os.path.join(self.palm_dir, pf)).convert('L')
         vein_img = Image.open(os.path.join(self.vein_dir, vf)).convert('L')
+        
         if self.transform:
             palm_img = self.transform(palm_img)
             vein_img = self.transform(vein_img)
+            
         if not isinstance(palm_img, torch.Tensor):
             palm_img = torch.tensor(np.array(palm_img), dtype=torch.float32).unsqueeze(0) / 255.
         if not isinstance(vein_img, torch.Tensor):
             vein_img = torch.tensor(np.array(vein_img), dtype=torch.float32).unsqueeze(0) / 255.
+            
         return palm_img, vein_img, torch.tensor(label, dtype=torch.long)

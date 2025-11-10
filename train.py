@@ -9,13 +9,15 @@ from net import (Restormer_Encoder, DeformableAlignment,
                      BaseFeatureExtraction, DetailFeatureExtraction, ArcFaceClassifier)
 from utils.loss import TripletLoss, RecognitionLoss
 from utils.dataset import ContrastDataset, PairDataset
+from mobilenet import MobileFaceNet
+
 
 class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     save_dir = 'models'
     log_dir = 'runs' 
-    palm_dir1, vein_dir1 = '/root/autodl-tmp/CDDFuse/MMIF-CDDFuse-main/roi/CASIA/vi/roi', '/root/autodl-tmp/CDDFuse/MMIF-CDDFuse-main/roi/CASIA/ir/roi'
-   #palm_dir2, vein_dir2 = 
+    palm_dir1, vein_dir1 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/vi', 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/ir'
+    palm_dir2, vein_dir2 = 
     p1_epochs, p1_batch, p1_lr = 50, 8, 1e-4 
     p1_patience = 8 
     
@@ -174,10 +176,17 @@ def train_phase2(encoder, config, writer=None):
         ckpt = torch.load(ckpt_path, map_location=config.device)
         encoder.load_state_dict(ckpt['encoder_state_dict'])
     
-    train_ds = PairDataset(config.palm_dir1, config.vein_dir1, get_transforms(strong=False), True, config.train_ratio)
-    val_ds = PairDataset(config.palm_dir1, config.vein_dir1, get_transforms(strong=False), False, config.train_ratio)
-    train_loader = DataLoader(train_ds, config.p2_batch, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, config.p2_batch, shuffle=False, num_workers=4)
+    # 使用第二阶段的数据，按 0.8:0.2 划分训练集和验证集
+    train_ds = PairDataset(config.palm_dir2, config.vein_dir2, get_transforms(strong=True), split='train')
+    val_ds = PairDataset(config.palm_dir2, config.vein_dir2, get_transforms(strong=False), split='val')
+    
+    print(f"第二阶段数据集信息:")
+    print(f"训练集大小：{len(train_ds)}对图像")
+    print(f"验证集大小：{len(val_ds)}对图像")
+    print(f"类别数量：{train_ds.num_classes}")
+    
+    train_loader = DataLoader(train_ds, batch_size=config.p2_batch, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=config.p2_batch, shuffle=False, num_workers=4, pin_memory=True)
     
     alignment = nn.DataParallel(DeformableAlignment(config.dim)).to(config.device)
     base_fuse = nn.DataParallel(BaseFeatureExtraction(config.dim, config.num_heads)).to(config.device)
@@ -285,10 +294,7 @@ def train_phase2(encoder, config, writer=None):
 def main():
     writer = SummaryWriter(log_dir=config.log_dir)
     
-    encoder = Restormer_Encoder(
-        inp_channels=1, dim=config.dim, num_blocks=[4,4],
-        heads=[config.num_heads]*3
-    ).to(config.device)
+    encoder = MobileFaceNet(input_channel=3, input_width=128, input_height=128).to(config.device)
     
     p1_loss = train_phase1(encoder, config, writer)
     p2_acc = train_phase2(encoder, config, writer)
