@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange 
 from torchvision.ops import DeformConv2d
 import numpy as np
+
 # ==================== 定义 AttentionBase 类（基础注意力机制）====================
 class AttentionBase(nn.Module):
     def __init__(self,

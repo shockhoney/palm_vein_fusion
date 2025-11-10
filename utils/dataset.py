@@ -87,12 +87,12 @@ class PairDataset(Data.Dataset):
         self.vein_dir = vein_dir
         self.transform = transform
         
-        # 获取所有人的ID（文件夹名）
+
         self.pids = sorted([d for d in os.listdir(palm_dir) if os.path.isdir(os.path.join(palm_dir, d))])
         self.pid_to_label = {pid: i for i, pid in enumerate(self.pids)}
         self.num_classes = len(self.pids)
         
-        # 收集所有图像对
+
         all_pairs = []
         for pid in self.pids:
             palm_path = os.path.join(palm_dir, pid)
@@ -101,16 +101,16 @@ class PairDataset(Data.Dataset):
             if not os.path.exists(vein_path):
                 continue
                 
-            # 获取该人所有的图像文件
+
             palm_files = sorted([f for f in os.listdir(palm_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
             vein_files = sorted([f for f in os.listdir(vein_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
             
-            # 按文件名配对
+
             for pf in palm_files:
-                if pf in vein_files:  # 如果文件名完全相同
+                if pf in vein_files:  
                     all_pairs.append((os.path.join(pid, pf), os.path.join(pid, pf), self.pid_to_label[pid]))
         
-        # 对整个数据集进行划分
+
         split_idx = int(len(all_pairs) * 0.8)
         self.samples = all_pairs[:split_idx] if split == 'train' else all_pairs[split_idx:]
         
