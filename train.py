@@ -117,9 +117,32 @@ def train_phase1(encoder, config, writer=None):
         for batch_idx, (anchor, positive, negative, _) in enumerate(pbar):
             anchor, positive, negative = anchor.to(config.device), positive.to(config.device), negative.to(config.device)
             
-            feat_a = torch.nn.functional.adaptive_avg_pool2d(encoder(anchor)[0], 1).flatten(1)
-            feat_p = torch.nn.functional.adaptive_avg_pool2d(encoder(positive)[0], 1).flatten(1)
-            feat_n = torch.nn.functional.adaptive_avg_pool2d(encoder(negative)[0], 1).flatten(1)
+            # 兼容 encoder 返回不同格式（tensor 或 tuple/list）的情况，摘取特征并保证得到 [B, C]
+            def extract_feat(x):
+                out = encoder(x)
+                # 如果 encoder 返回 (base, detail, ...)，优先取第一个元素
+                if isinstance(out, (list, tuple)):
+                    feat = out[0]
+                else:
+                    feat = out
+
+                # 处理不同维度的输出，目标是得到 (B, C)
+                if feat.dim() == 4:
+                    # [B, C, H, W] -> 全局平均池化 -> [B, C]
+                    return torch.nn.functional.adaptive_avg_pool2d(feat, 1).flatten(1)
+                elif feat.dim() == 3:
+                    # [B, C, L] 或 [B, H, W] 等，补一个维度再池化
+                    feat4 = feat.unsqueeze(-1)
+                    return torch.nn.functional.adaptive_avg_pool2d(feat4, 1).flatten(1)
+                elif feat.dim() == 2:
+                    # 已经是 [B, C]
+                    return feat.flatten(1)
+                else:
+                    raise RuntimeError(f"Unexpected feature dim from encoder: {feat.dim()}")
+
+            feat_a = extract_feat(anchor)
+            feat_p = extract_feat(positive)
+            feat_n = extract_feat(negative)
             
             # 损失和优化
             total_loss, dist_ap, dist_an = criterion(feat_a, feat_p, feat_n)
@@ -286,8 +309,7 @@ def train_phase2(encoder, config, writer=None):
 
 def main():
     writer = SummaryWriter(log_dir=config.log_dir)
-    
-    encoder = MobileFaceNet(input_channel=3, input_width=128, input_height=128).to(config.device)
+    encoder = MobileFaceNet(input_channel=1, input_width=128, input_height=128).to(config.device)
     
     p1_loss = train_phase1(encoder, config, writer)
     p2_acc = train_phase2(encoder, config, writer)

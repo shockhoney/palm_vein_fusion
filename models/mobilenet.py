@@ -69,7 +69,7 @@ class Residual(Module):
         return self.model(x)
 
 class MobileFaceNet(Module):
-    def __init__(self, input_channel=3, input_width=96, input_height=96):
+    def __init__(self, input_channel=1, input_width=96, input_height=96):
         super(MobileFaceNet, self).__init__()
         self.conv1 = ConvBlock(input_channel, 32, kernel=(3, 3), stride=(2, 2), padding=(1, 1))
         self.conv2_dw = ConvBlock(32, 32, kernel=(3, 3), stride=(1, 1), padding=(1, 1), groups=32)
