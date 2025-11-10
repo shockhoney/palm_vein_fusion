@@ -189,7 +189,7 @@ def batch_process(input_path, output_dir, model_path, scale=0.6, padding=5,
             del detector
     
 def main():
-    parser = argparse.ArgumentParser(description='手掌ROI提取工具')
+    parser = argparse.ArgumentParser(description='roi_extraction:')
     parser.add_argument('-i', '--input', required=True, help='输入图像/文件夹路径')
     parser.add_argument('-o', '--output', default='roi_output', help='输出目录（默认: roi_output）')
     args = parser.parse_args()
