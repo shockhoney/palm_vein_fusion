@@ -5,16 +5,16 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import os
 from tqdm import tqdm
-from net import (Restormer_Encoder, DeformableAlignment, 
+from models.net import (Restormer_Encoder, DeformableAlignment, 
                      BaseFeatureExtraction, DetailFeatureExtraction, ArcFaceClassifier)
 from utils.loss import TripletLoss, RecognitionLoss
 from utils.dataset import ContrastDataset, PairDataset
-from mobilenet import MobileFaceNet
+from models.mobilenet import MobileFaceNet
 
 
 class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    save_dir = 'models'
+    save_dir = 'outputs/models'
     log_dir = 'runs' 
     palm_dir1, vein_dir1 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/vi', 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/ir'
     palm_dir2, vein_dir2 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/PolyU/NIR', 'C:/Users/admin/Desktop/palm_vein_fusion/data/PolyU/Red'
