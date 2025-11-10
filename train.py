@@ -15,7 +15,7 @@ class Config:
     save_dir = 'models'
     log_dir = 'runs' 
     palm_dir1, vein_dir1 = '/root/autodl-tmp/CDDFuse/MMIF-CDDFuse-main/roi/CASIA/vi/roi', '/root/autodl-tmp/CDDFuse/MMIF-CDDFuse-main/roi/CASIA/ir/roi'
-    #palm_dir2, vein_dir2 = 
+   #palm_dir2, vein_dir2 = 
     p1_epochs, p1_batch, p1_lr = 50, 8, 1e-4 
     p1_patience = 8 
     
