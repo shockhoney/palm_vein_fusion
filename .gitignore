@@ -1,4 +1,8 @@
 #dataset
 data/
-
+#python cache
+__pycache__/
+#logs and outputs
+runs/
+outputs/models/
 
