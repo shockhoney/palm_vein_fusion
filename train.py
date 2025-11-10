@@ -17,7 +17,7 @@ class Config:
     save_dir = 'models'
     log_dir = 'runs' 
     palm_dir1, vein_dir1 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/vi', 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/ir'
-    palm_dir2, vein_dir2 = 
+    palm_dir2, vein_dir2 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/PolyU/NIR', 'C:/Users/admin/Desktop/palm_vein_fusion/data/PolyU/Red'
     p1_epochs, p1_batch, p1_lr = 50, 8, 1e-4 
     p1_patience = 8 
     
@@ -176,15 +176,8 @@ def train_phase2(encoder, config, writer=None):
         ckpt = torch.load(ckpt_path, map_location=config.device)
         encoder.load_state_dict(ckpt['encoder_state_dict'])
     
-    # 使用第二阶段的数据，按 0.8:0.2 划分训练集和验证集
     train_ds = PairDataset(config.palm_dir2, config.vein_dir2, get_transforms(strong=True), split='train')
     val_ds = PairDataset(config.palm_dir2, config.vein_dir2, get_transforms(strong=False), split='val')
-    
-    print(f"第二阶段数据集信息:")
-    print(f"训练集大小：{len(train_ds)}对图像")
-    print(f"验证集大小：{len(val_ds)}对图像")
-    print(f"类别数量：{train_ds.num_classes}")
-    
     train_loader = DataLoader(train_ds, batch_size=config.p2_batch, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config.p2_batch, shuffle=False, num_workers=4, pin_memory=True)
     
