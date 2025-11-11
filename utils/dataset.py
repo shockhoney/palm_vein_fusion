@@ -30,7 +30,6 @@ class ContrastDataset(Dataset):
                 self.id_dict[pid]['vein'].append(f)
         
         self.all_ids = sorted(self.id_dict.keys())
-        # 映射 pid -> label （可靠，不依赖文件名能否转换为 int）
         self.pid_to_label = {pid: i for i, pid in enumerate(self.all_ids)}
 
         self.samples = []
@@ -66,7 +65,6 @@ class ContrastDataset(Dataset):
         pos_path = os.path.join(self.palm_dir if pos_mod == 'palm' else self.vein_dir, pos_file)
         positive_img = Image.open(pos_path).convert('L')
         
-        # 随机选择一个有样本的不同 person id 作为负样本
         neg_candidates = [pid for pid in self.all_ids if pid != person_id and (self.id_dict[pid]['palm'] + self.id_dict[pid]['vein'])]
         if not neg_candidates:
             raise RuntimeError('No negative candidates found in dataset')
@@ -88,60 +86,65 @@ class ContrastDataset(Dataset):
             except Exception as e:
                 raise RuntimeError(f"Error applying transform: {e}")
 
-        # 使用 pid 到 label 的映射，避免 pid 不是数字时报错
         label = self.pid_to_label.get(person_id, 0)
         return anchor_img, positive_img, negative_img, label
     
-class PairDataset(Data.Dataset):
+import os
+import torch
+from torch.utils.data import Dataset
+from PIL import Image
+
+class PairDataset(Dataset):
     def __init__(self, palm_dir, vein_dir, transform=None, split='train'):
         self.palm_dir = palm_dir
         self.vein_dir = vein_dir
         self.transform = transform
-        
 
-        self.pids = sorted([d for d in os.listdir(palm_dir) if os.path.isdir(os.path.join(palm_dir, d))])
-        self.pid_to_label = {pid: i for i, pid in enumerate(self.pids)}
-        self.num_classes = len(self.pids)
-        
+        # 读取所有文件
+        self.palm_imgs, self.vein_imgs, self.raw_labels = self.load_files(split)
 
-        all_pairs = []
-        for pid in self.pids:
-            palm_path = os.path.join(palm_dir, pid)
-            vein_path = os.path.join(vein_dir, pid)
-            
-            if not os.path.exists(vein_path):
+        # 自动生成 label 映射
+        unique_labels = sorted(set(self.raw_labels))
+        self.label_map = {old: new for new, old in enumerate(unique_labels)}
+        self.num_classes = len(unique_labels)
+
+        # 映射 labels
+        self.labels = torch.tensor([self.label_map[l] for l in self.raw_labels], dtype=torch.long)
+
+    def load_files(self, split):
+        palm_imgs, vein_imgs, labels = [], [], []
+
+        # 假设每个类别是一个子文件夹
+        for idx, cls in enumerate(sorted(os.listdir(self.palm_dir))):
+            cls_palm_dir = os.path.join(self.palm_dir, cls)
+            cls_vein_dir = os.path.join(self.vein_dir, cls)
+            if not os.path.isdir(cls_palm_dir) or not os.path.isdir(cls_vein_dir):
                 continue
-                
 
-            palm_files = sorted([f for f in os.listdir(palm_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-            vein_files = sorted([f for f in os.listdir(vein_path) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
-            
+            imgs_palm = sorted(os.listdir(cls_palm_dir))
+            imgs_vein = sorted(os.listdir(cls_vein_dir))
+            num_samples = min(len(imgs_palm), len(imgs_vein))
 
-            for pf in palm_files:
-                if pf in vein_files:  
-                    all_pairs.append((os.path.join(pid, pf), os.path.join(pid, pf), self.pid_to_label[pid]))
-        
+            split_idx = int(num_samples * 0.8) if split == 'train' else int(num_samples * 0.8)
+            start, end = (0, split_idx) if split == 'train' else (split_idx, num_samples)
 
-        split_idx = int(len(all_pairs) * 0.8)
-        self.samples = all_pairs[:split_idx] if split == 'train' else all_pairs[split_idx:]
-        
-        print(f"{'训练' if split == 'train' else '验证'}集: {len(self.samples)}对图像，{self.num_classes}个类别")
+            for i in range(start, end):
+                palm_imgs.append(os.path.join(cls_palm_dir, imgs_palm[i]))
+                vein_imgs.append(os.path.join(cls_vein_dir, imgs_vein[i]))
+                labels.append(idx)  # 用 idx 作为原始 label
+
+        return palm_imgs, vein_imgs, labels
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.palm_imgs)
 
     def __getitem__(self, idx):
-        pf, vf, label = self.samples[idx]
-        palm_img = Image.open(os.path.join(self.palm_dir, pf)).convert('L')
-        vein_img = Image.open(os.path.join(self.vein_dir, vf)).convert('L')
-        
-        if self.transform:
-            palm_img = self.transform(palm_img)
-            vein_img = self.transform(vein_img)
-            
-        if not isinstance(palm_img, torch.Tensor):
-            palm_img = torch.tensor(np.array(palm_img), dtype=torch.float32).unsqueeze(0) / 255.
-        if not isinstance(vein_img, torch.Tensor):
-            vein_img = torch.tensor(np.array(vein_img), dtype=torch.float32).unsqueeze(0) / 255.
-            
-        return palm_img, vein_img, torch.tensor(label, dtype=torch.long)
+        palm = Image.open(self.palm_imgs[idx]).convert('L')
+        vein = Image.open(self.vein_imgs[idx]).convert('L')
+        label = self.labels[idx]
+
+        if self.transform is not None:
+            palm = self.transform(palm)
+            vein = self.transform(vein)
+
+        return palm, vein, label
