@@ -9,8 +9,8 @@ from models.net import (Restormer_Encoder, DeformableAlignment,
                      BaseFeatureExtraction, DetailFeatureExtraction, ArcFaceClassifier)
 from utils.loss import TripletLoss, RecognitionLoss
 from utils.dataset import ContrastDataset, PairDataset
-from models.mobilenet import MobileFaceNet
-
+from models.mobilenet import HybridEncoder as MobileNet_Encoder
+from models.stage import FineFusionTransformer
 
 class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -18,7 +18,7 @@ class Config:
     log_dir = 'runs' 
     palm_dir1, vein_dir1 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/vi', 'C:/Users/admin/Desktop/palm_vein_fusion/data/CASIA_dataset/ir'
     palm_dir2, vein_dir2 = 'C:/Users/admin/Desktop/palm_vein_fusion/data/PolyU/NIR', 'C:/Users/admin/Desktop/palm_vein_fusion/data/PolyU/Red'
-    p1_epochs, p1_batch, p1_lr = 50, 8, 1e-4 
+    p1_epochs, p1_batch, p1_lr = 1, 8, 1e-4 
     p1_patience = 8 
     
     p2_epochs, p2_batch, p2_lr, p2_enc_lr = 50, 8, 1e-4, 1e-5 
@@ -60,7 +60,7 @@ class EarlyStopping:
 
 
 def get_transforms(strong=True):
-    base = [transforms.Resize((128, 128))]
+    base = [transforms.Resize((64, 64))]
     if strong:
         base += [transforms.RandomRotation(15),
                 transforms.RandomAffine(0, translate=(0.1, 0.1)),
@@ -73,17 +73,20 @@ def get_transforms(strong=True):
     return transforms.Compose(base)
 
 
-def forward_model(encoder, palm, vein, alignment, base_fuse, detail_fuse, classifier, labels=None):
+def forward_model(encoder, palm, vein, Fine_fusion, classifier, labels=None):
     base_p, detail_p, _ = encoder(palm)
     base_v, detail_v, _ = encoder(vein)  
-    # 对齐
-    ab_p = alignment(base_v, base_p)
-    ab_v = alignment(base_p, base_v)
-    ad_p = alignment(detail_v, detail_p)
-    ad_v = alignment(detail_p, detail_v)
-    # 融合
-    fused_base = base_fuse(ab_p + ab_v)
-    fused_detail = detail_fuse(ad_p + ad_v)    
+    # # 对齐
+    # ab_p = alignment(base_v, base_p)
+    # ab_v = alignment(base_p, base_v)
+    # ad_p = alignment(detail_v, detail_p)
+    # ad_v = alignment(detail_p, detail_v)
+    # # 融合
+    # fused_base = base_fuse(ab_p + ab_v)
+    # fused_detail = detail_fuse(ad_p + ad_v)   
+    # 使用细致融合 Transformer
+    fused_base = Fine_fusion(base_p, base_v) 
+    fused_detail = Fine_fusion(detail_p, detail_v)
     # 分类
     fused = torch.cat([fused_base, fused_detail], dim=1)
     logits, _ = classifier(fused, labels)
@@ -204,17 +207,19 @@ def train_phase2(encoder, config, writer=None):
     train_loader = DataLoader(train_ds, batch_size=config.p2_batch, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=config.p2_batch, shuffle=False, num_workers=4, pin_memory=True)
     
-    alignment = nn.DataParallel(DeformableAlignment(config.dim)).to(config.device)
-    base_fuse = nn.DataParallel(BaseFeatureExtraction(config.dim, config.num_heads)).to(config.device)
-    detail_fuse = nn.DataParallel(DetailFeatureExtraction(num_layers=1)).to(config.device)
+    # alignment = nn.DataParallel(DeformableAlignment(config.dim)).to(config.device)
+    # base_fuse = nn.DataParallel(BaseFeatureExtraction(config.dim, config.num_heads)).to(config.device)
+    # detail_fuse = nn.DataParallel(DetailFeatureExtraction(num_layers=1)).to(config.device)
+    fine_fusion = nn.DataParallel(FineFusionTransformer(dim=config.dim)).to(config.device)
     classifier = nn.DataParallel(ArcFaceClassifier(config.dim*2, config.num_classes)).to(config.device)
     
     criterion = RecognitionLoss(w_cls=1.0, w_decomp=0.3, label_smoothing=0.1)
     optimizer = torch.optim.Adam([
         {'params': encoder.parameters(), 'lr': config.p2_enc_lr},
-        {'params': alignment.parameters(), 'lr': config.p2_lr},
-        {'params': base_fuse.parameters(), 'lr': config.p2_lr},
-        {'params': detail_fuse.parameters(), 'lr': config.p2_lr},
+        # {'params': alignment.parameters(), 'lr': config.p2_lr},
+        # {'params': base_fuse.parameters(), 'lr': config.p2_lr},
+        # {'params': detail_fuse.parameters(), 'lr': config.p2_lr},
+        {'params': fine_fusion.parameters(), 'lr': config.p2_lr},
         {'params': classifier.parameters(), 'lr': config.p2_lr}
     ], weight_decay=1e-2)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.p2_epochs)
@@ -223,7 +228,7 @@ def train_phase2(encoder, config, writer=None):
     best_acc = 0.0
     
     for epoch in range(config.p2_epochs):
-        for model in [encoder, alignment, base_fuse, detail_fuse, classifier]:
+        for model in [encoder, fine_fusion, classifier]:
             model.train()
         
         train_correct, train_total = 0, 0
@@ -234,7 +239,7 @@ def train_phase2(encoder, config, writer=None):
             palm, vein, labels = palm.to(config.device), vein.to(config.device), labels.to(config.device)
             
             logits, base_p, base_v, detail_p, detail_v, fused_base, fused_detail = forward_model(
-                encoder, palm, vein, alignment, base_fuse, detail_fuse, classifier, labels
+                encoder, palm, vein, fine_fusion, classifier, labels
             )
             
             # 损失和优化
@@ -259,7 +264,7 @@ def train_phase2(encoder, config, writer=None):
         train_loss = train_loss_sum / len(train_loader)
         
         # 验证
-        for model in [encoder, alignment, base_fuse, detail_fuse, classifier]:
+        for model in [encoder, fine_fusion, classifier]:
             model.eval()
         
         val_correct, val_total = 0, 0
@@ -268,7 +273,7 @@ def train_phase2(encoder, config, writer=None):
             for palm, vein, labels in val_loader:
                 palm, vein, labels = palm.to(config.device), vein.to(config.device), labels.to(config.device)
                 logits, base_p, base_v, detail_p, detail_v, fused_base, fused_detail = forward_model(
-                    encoder, palm, vein, alignment, base_fuse, detail_fuse, classifier)
+                    encoder, palm, vein, fine_fusion, classifier)
                 total_loss, _, _, _ = criterion(
                     logits, labels, base_p, base_v, detail_p, detail_v, fused_base, fused_detail)
                 _, pred = torch.max(logits, 1)
@@ -292,9 +297,10 @@ def train_phase2(encoder, config, writer=None):
             best_acc = train_acc
             torch.save({
                 'epoch': epoch+1, 'encoder_state_dict': encoder.state_dict(),
-                'alignment_state_dict': alignment.state_dict(),
-                'base_fuse_state_dict': base_fuse.state_dict(),
-                'detail_fuse_state_dict': detail_fuse.state_dict(),
+                # 'alignment_state_dict': alignment.state_dict(),
+                # 'base_fuse_state_dict': base_fuse.state_dict(),
+                # 'detail_fuse_state_dict': detail_fuse.state_dict(),
+                'fine_fusion_state_dict': fine_fusion.state_dict(),
                 'classifier_state_dict': classifier.state_dict(),
                 'best_acc': best_acc
             }, os.path.join(config.save_dir, 'full_model_phase2_best.pth'))
@@ -309,10 +315,10 @@ def train_phase2(encoder, config, writer=None):
 
 def main():
     writer = SummaryWriter(log_dir=config.log_dir)
-    encoder = MobileFaceNet(input_channel=1, input_width=128, input_height=128).to(config.device)
+    encoder = MobileNet_Encoder().to(config.device)
     
     p1_loss = train_phase1(encoder, config, writer)
-    p2_acc = train_phase2(encoder, config, writer)
+    p2_acc = train_phase2(encoder,  config, writer)
     
     print(f"Phase1 Min Loss: {p1_loss:.4f}")
     print(f"Phase2 Max Accuracy: {p2_acc:.2f}%")

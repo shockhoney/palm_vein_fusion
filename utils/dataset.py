@@ -5,15 +5,16 @@ import random
 import torch
 import torch.utils.data as Data
 import numpy as np
-class ContrastDataset(Dataset):
-    
+
+
+class ContrastDataset(Dataset):   
     def __init__(self, palm_dir, vein_dir, transform=None):
         self.palm_dir = palm_dir
         self.vein_dir = vein_dir
         self.transform = transform
-        
+
         self.id_dict = {}
-        
+
         for f in os.listdir(palm_dir):
             if f.lower().endswith(('.jpg', '.png', '.jpeg')):
                 pid = f.split('_')[0]
@@ -22,14 +23,16 @@ class ContrastDataset(Dataset):
                 self.id_dict[pid]['palm'].append(f)
         
         for f in os.listdir(vein_dir):
-            if f.lower().endswith('.jpg'):
+            if f.lower().endswith(('.jpg', '.png', '.jpeg')):
                 pid = f.split('_')[0]
                 if pid not in self.id_dict:
                     self.id_dict[pid] = {'palm': [], 'vein': []}
                 self.id_dict[pid]['vein'].append(f)
         
         self.all_ids = sorted(self.id_dict.keys())
-        
+        # 映射 pid -> label （可靠，不依赖文件名能否转换为 int）
+        self.pid_to_label = {pid: i for i, pid in enumerate(self.all_ids)}
+
         self.samples = []
         for pid in self.all_ids:
             for f in self.id_dict[pid]['palm']:
@@ -37,7 +40,7 @@ class ContrastDataset(Dataset):
             for f in self.id_dict[pid]['vein']:
                 self.samples.append(('vein', pid, f))
         
-        print(f"数据集：{len(self.all_ids)}人，{len(self.samples)}样本")
+        print(f"dataset：{len(self.all_ids)}persons，{len(self.samples)}samples")
     
     def __len__(self):
         return len(self.samples)
@@ -63,7 +66,11 @@ class ContrastDataset(Dataset):
         pos_path = os.path.join(self.palm_dir if pos_mod == 'palm' else self.vein_dir, pos_file)
         positive_img = Image.open(pos_path).convert('L')
         
-        neg_id = random.choice([pid for pid in self.all_ids if pid != person_id])
+        # 随机选择一个有样本的不同 person id 作为负样本
+        neg_candidates = [pid for pid in self.all_ids if pid != person_id and (self.id_dict[pid]['palm'] + self.id_dict[pid]['vein'])]
+        if not neg_candidates:
+            raise RuntimeError('No negative candidates found in dataset')
+        neg_id = random.choice(neg_candidates)
         neg_files = self.id_dict[neg_id]['palm'] + self.id_dict[neg_id]['vein']
         neg_file = random.choice(neg_files)
         
@@ -74,11 +81,15 @@ class ContrastDataset(Dataset):
         negative_img = Image.open(neg_path).convert('L')
         
         if self.transform:
-            anchor_img = self.transform(anchor_img)
-            positive_img = self.transform(positive_img)
-            negative_img = self.transform(negative_img)
-        
-        label = int(person_id) - 1
+            try:
+                anchor_img = self.transform(anchor_img)
+                positive_img = self.transform(positive_img)
+                negative_img = self.transform(negative_img)
+            except Exception as e:
+                raise RuntimeError(f"Error applying transform: {e}")
+
+        # 使用 pid 到 label 的映射，避免 pid 不是数字时报错
+        label = self.pid_to_label.get(person_id, 0)
         return anchor_img, positive_img, negative_img, label
     
 class PairDataset(Data.Dataset):
