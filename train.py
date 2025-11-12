@@ -8,7 +8,7 @@ from tqdm import tqdm
 from utils.loss import TripletLoss, RecognitionLoss
 from utils.dataset import ContrastDataset, PairDataset
 from models.stage1 import EfficientViT,ConvNeXt
-from models.stage2 import 
+from models.stage2 import Stage2Fusion
 
 class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
