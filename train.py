@@ -5,12 +5,10 @@ from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import os
 from tqdm import tqdm
-from models.net import (Restormer_Encoder, DeformableAlignment, 
-                     BaseFeatureExtraction, DetailFeatureExtraction, ArcFaceClassifier)
 from utils.loss import TripletLoss, RecognitionLoss
 from utils.dataset import ContrastDataset, PairDataset
-from models.mobilenet import HybridEncoder as MobileNet_Encoder
-from models.stage import FineFusionTransformer
+from models.stage1 import EfficientViT,ConvNeXt
+from models.stage2 import 
 
 class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -71,28 +69,6 @@ def get_transforms(strong=True):
     
     base += [transforms.ToTensor(), transforms.Normalize(mean=[0.5], std=[0.5])]
     return transforms.Compose(base)
-
-
-def forward_model(encoder, palm, vein, Fine_fusion, classifier, labels=None):
-    base_p, detail_p, _ = encoder(palm)
-    base_v, detail_v, _ = encoder(vein)  
-    # # 对齐
-    # ab_p = alignment(base_v, base_p)
-    # ab_v = alignment(base_p, base_v)
-    # ad_p = alignment(detail_v, detail_p)
-    # ad_v = alignment(detail_p, detail_v)
-    # # 融合
-    # fused_base = base_fuse(ab_p + ab_v)
-    # fused_detail = detail_fuse(ad_p + ad_v)   
-    # 使用细致融合 Transformer
-    fused_base = Fine_fusion(base_p, base_v) 
-    fused_detail = Fine_fusion(detail_p, detail_v)
-    # 分类
-    fused = torch.cat([fused_base, fused_detail], dim=1)
-    logits, _ = classifier(fused, labels)
-    
-    return logits, base_p, base_v, detail_p, detail_v, fused_base, fused_detail
-
 
 # ============================================================
 # 第一阶段：对比学习
@@ -290,7 +266,7 @@ def train_phase2(encoder, config, writer=None):
             writer.add_scalar('Phase2/TrainLoss', train_loss, epoch)
             writer.add_scalar('Phase2/TrainAcc', train_acc, epoch)
             writer.add_scalar('Phase2/ValLoss', val_loss, epoch)
-            writer.add_scalar('Phase2/ValAcc', val_acc, epoch)
+           # writer.add_scalar('Phase2/ValAcc', val_acc, epoch)
             writer.add_scalar('Phase2/LearningRate', current_lr, epoch)
         
         if train_acc > best_acc:
@@ -315,10 +291,10 @@ def train_phase2(encoder, config, writer=None):
 
 def main():
     writer = SummaryWriter(log_dir=config.log_dir)
-    encoder = MobileNet_Encoder().to(config.device)
+    Global_feature = EfficientViT().to(config.device)
+    Local_feature = ConvNeXt().to(config.device)
     
-    p1_loss = train_phase1(encoder, config, writer)
-    p2_acc = train_phase2(encoder,  config, writer)
+
     
     print(f"Phase1 Min Loss: {p1_loss:.4f}")
     print(f"Phase2 Max Accuracy: {p2_acc:.2f}%")
