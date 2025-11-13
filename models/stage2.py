@@ -1,204 +1,290 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _flatten_feature(x: torch.Tensor):
+# -------------------------------
+# 工具：特征对齐（Linear -> same dim）
+# -------------------------------
+class FeatureAlign(nn.Module):
     """
-    将任意形状的特征展开成 (B, N, C) 的序列形式，便于送入注意力模块。
-    返回序列以及重建所需的元信息。
+    将输入向量线性投影到统一维度，便于注意力/加法/拼接。
     """
-    if x.dim() == 4:
-        b, c, h, w = x.shape
-        seq = x.view(b, c, h * w).transpose(1, 2)  # (B, HW, C)
-        meta = {"type": "spatial", "shape": (h, w)}
-    elif x.dim() == 3:
-        # 默认输入已经是 (B, N, C)
-        seq = x
-        meta = {"type": "sequence", "length": x.size(1)}
-    elif x.dim() == 2:
-        # 退化为长度为 1 的序列
-        seq = x.unsqueeze(1)
-        meta = {"type": "vector"}
-    else:
-        raise ValueError(f"Unsupported feature dimension: {x.shape}")
-    return seq, meta
-
-
-def _recover_feature(seq: torch.Tensor, meta, channel_dim: int):
-    """
-    将序列恢复到与输入相同的形状。`channel_dim` 代表当前序列的通道数（注意力输出维度）。
-    """
-    if meta["type"] == "spatial":
-        h, w = meta["shape"]
-        return seq.transpose(1, 2).reshape(seq.size(0), channel_dim, h, w)
-    if meta["type"] == "sequence":
-        return seq
-    # vector
-    return seq.squeeze(1)
-
-
-def _ensure_rank4(x: torch.Tensor) -> torch.Tensor:
-    """
-    统一输出到 NCHW，便于后续卷积融合。
-    非空间特征会被视作 1x1 或 1xL 的伪特征图。
-    """
-    if x.dim() == 4:
-        return x
-    if x.dim() == 3:
-        # (B, N, C) -> (B, C, N, 1)
-        return x.transpose(1, 2).unsqueeze(-1)
-    if x.dim() == 2:
-        return x.unsqueeze(-1).unsqueeze(-1)
-    raise ValueError(f"Cannot convert tensor with shape {x.shape} to NCHW format")
-
-
-def _match_spatial(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
-    """
-    将张量 x 的空间尺寸调整为与 ref 一致。
-    """
-    if x.dim() != 4 or ref.dim() != 4:
-        return x
-    if x.shape[2:] == ref.shape[2:]:
-        return x
-    return F.interpolate(x, size=ref.shape[2:], mode="bilinear", align_corners=False)
-
-
-class CrossAttentionUnit(nn.Module):
-    """
-    基于 Multi-Head Attention 的跨模态交互模块：
-    - 查询来自主分支
-    - 键和值来自另一分支
-    - 之后跟随一个前馈网络
-    """
-
-    def __init__(self, dim: int, num_heads: int = 4, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(self, in_dim: int, out_dim: int, use_bn: bool = False):
         super().__init__()
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.norm_q = nn.LayerNorm(dim)
-        self.norm_kv = nn.LayerNorm(dim)
-        hidden_dim = int(dim * mlp_ratio)
-        self.ffn = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
+        self.fc = nn.Linear(in_dim, out_dim, bias=not use_bn)
+        self.bn = nn.BatchNorm1d(out_dim) if use_bn else nn.Identity()
+        nn.init.kaiming_normal_(self.fc.weight, nonlinearity='linear')
+        if self.fc.bias is not None:
+            nn.init.zeros_(self.fc.bias)
+
+    def forward(self, x):
+        x = self.fc(x)
+        if isinstance(self.bn, nn.BatchNorm1d):
+            x = self.bn(x)
+        return x
+
+
+# ---------------------------------------------------------
+# 空间注意力：对两个空间特征图使用空间注意力进行自适应融合
+# ---------------------------------------------------------
+class SpatialAttentionFusion(nn.Module):
+    """
+    对两个空间特征图使用空间注意力进行自适应融合。
+    输入：两路同尺寸特征图 a, b (N, C, H, W)；输出同尺寸 (N, C, H, W)。
+    """
+    def __init__(self, in_channels: int, reduction: int = 16):
+        super().__init__()
+        hid = max(in_channels // reduction, 8)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels * 2, hid, 1, bias=False),
+            nn.BatchNorm2d(hid),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hid, 2, 1, bias=True)  # 2 路权重
         )
 
-    def forward(self, q_feat: torch.Tensor, kv_feat: torch.Tensor) -> torch.Tensor:
-        q = self.norm_q(q_feat)
-        kv = self.norm_kv(kv_feat)
-        attn_out, _ = self.attn(q, kv, kv)
-        out = q_feat + attn_out
-        out = out + self.ffn(out)
-        return out
+    def forward(self, a: torch.Tensor, b: torch.Tensor):
+        assert a.shape == b.shape, "SpatialAttentionFusion: a/b 尺寸必须一致"
+        x = torch.cat([a, b], dim=1)              # (N, 2C, H, W)
+        logits = self.conv(x)                      # (N, 2, H, W)
+        weights = F.softmax(logits, dim=1)         # 在 2 路上做 softmax
+        w_a, w_b = weights[:, 0:1], weights[:, 1:2]
+        fused = w_a * a + w_b * b
+        return fused, (w_a, w_b)
 
 
-class CrossFusionBlock(nn.Module):
+class ConvAlign2d(nn.Module):
     """
-    将两路特征映射到统一维度后，进行双向跨注意力交互。
+    1x1 卷积 + BN：将通道数对齐到目标维度，用于空间特征图对齐。
     """
-
-    def __init__(self, in_dim_a: int, in_dim_b: int, hidden_dim: int,
-                 num_heads: int = 4, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(self, in_ch: int, out_ch: int, use_bn: bool = True):
         super().__init__()
-        self.proj_a = nn.Linear(in_dim_a, hidden_dim)
-        self.proj_b = nn.Linear(in_dim_b, hidden_dim)
-        self.cross_a = CrossAttentionUnit(hidden_dim, num_heads, mlp_ratio, dropout)
-        self.cross_b = CrossAttentionUnit(hidden_dim, num_heads, mlp_ratio, dropout)
+        layers = [nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=not use_bn)]
+        if use_bn:
+            layers.append(nn.BatchNorm2d(out_ch))
+        self.proj = nn.Sequential(*layers)
+        # init
+        for m in self.proj:
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor):
-        seq_a, meta_a = _flatten_feature(feat_a)
-        seq_b, meta_b = _flatten_feature(feat_b)
-
-        seq_a = self.proj_a(seq_a)
-        seq_b = self.proj_b(seq_b)
-
-        updated_a = self.cross_a(seq_a, seq_b)
-        updated_b = self.cross_b(seq_b, seq_a)
-
-        out_a = _recover_feature(updated_a, meta_a, updated_a.size(-1))
-        out_b = _recover_feature(updated_b, meta_b, updated_b.size(-1))
-        return out_a, out_b
+    def forward(self, x):
+        return self.proj(x)
 
 
-class Stage2Fusion(nn.Module):
+# ---------------------------------------------------------
+# 通道注意力（Channel Attention）对"二路向量"做逐通道加权融合
+# ---------------------------------------------------------
+class PairwiseChannelAttentionFusion(nn.Module):
     """
-    第二阶段融合模块：
-    - global_blocks：用于 EfficientViT (全局特征) 的跨模态交互
-    - local_blocks：用于 ConvNeXt (局部/细节特征) 的跨模态交互
-    - 最终输出：global_fused、local_fused 以及二者拼接后的 fused_all
-      方便连接 ArcFace 等自定义分类头
+    输入：两路同维度向量 a, b （形状 (N, C)）
+    思路：
+      1) 拼接 [a, b] -> (N, 2C)
+      2) MLP 产生每个通道在 a/b 两路上的权重 logits -> (N, 2C)
+      3) 通道维度 reshape -> (N, 2, C)，在"路维"上做 softmax 得到 w_a, w_b
+      4) 融合：fused = w_a * a + w_b * b
+    优点：逐通道、权重和为 1，稳定可解释。
     """
+    def __init__(self, dim: int, reduction: int = 4, dropout: float = 0.0):
+        super().__init__()
+        hid = max(dim // reduction, 8)
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * dim, hid, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hid, 2 * dim, bias=True)
+        )
+        # 初始化
+        for m in self.mlp:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
+    def forward(self, a: torch.Tensor, b: torch.Tensor):
+        assert a.shape == b.shape, "PairwiseChannelAttentionFusion: a/b 维度必须一致"
+        x = torch.cat([a, b], dim=1)                # (N, 2C)
+        logits = self.mlp(x)                        # (N, 2C)
+        logits = logits.view(x.size(0), 2, -1)      # (N, 2, C)
+        weights = F.softmax(logits, dim=1)          # (N, 2, C) -> 两路权重逐通道相加为 1
+        wa, wb = weights[:, 0, :], weights[:, 1, :] # (N, C), (N, C)
+        fused = wa * a + wb * b                     # (N, C)
+        return fused, (wa, wb)
+
+
+# ---------------------------------------------------------
+# ArcFace 头（标准 ArcMarginProduct）
+# ---------------------------------------------------------
+class ArcMarginProduct(nn.Module):
+    """
+    ArcFace / CosFace 类似的角度间隔分类头（默认 ArcFace）：
+    输入向量与分类权重都做 L2 归一化，基于 cos(theta + m) 计算。
+    """
+    def __init__(self, in_features: int, out_features: int,
+                 s: float = 64.0, m: float = 0.50,
+                 easy_margin: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.easy_margin = easy_margin
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, input: torch.Tensor, label: torch.Tensor):
+        # 归一化特征与权重
+        cosine = F.linear(F.normalize(input), F.normalize(self.weight))  # (N, out)
+        sine = torch.sqrt(torch.clamp(1.0 - cosine**2, min=1e-9))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        # one-hot
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1), 1.0)
+
+        # 输出：真实类用 phi，其余用原 cos
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+        return output
+
+
+# ---------------------------------------------------------
+# 第二阶段：整合"全局-全局、局部-局部"的融合（支持空间特征）
+# ---------------------------------------------------------
+class Stage2FusionCA(nn.Module):
+    """
+    第二阶段融合模型（改进版）：
+    - 支持向量特征融合（通道注意力）
+    - 支持空间特征融合（空间注意力）
+
+    参数：
+      - in_dim_global_palm / vein：第一阶段全局向量维度（默认 ViT embed_dim[-1]）
+      - in_dim_local_palm / vein：第一阶段局部向量维度（默认 ConvNeXt dims[-1]）
+      - out_dim_global / out_dim_local：对齐后的通道数（建议相同，如 256）
+      - use_spatial_fusion：是否对局部特征使用空间注意力融合（保留空间信息）
+      - final_l2norm：融合后是否 L2 归一化（建议 True，以便 ArcFace）
+      - with_arcface：是否启用 ArcFace 分类头（可选）
+
+    前向：
+      forward_features(...) -> fused_feat（拼接后的融合向量）
+      forward(..., labels)  -> ArcFace logits（若 with_arcface=True）
+    """
     def __init__(self,
-                 vit_dim: int = 192,
-                 cnn_dim: int = 768,
-                 fusion_dim: int = 256,
-                 num_heads: int = 4,
-                 depth: int = 2,
-                 dropout: float = 0.0):
+                 in_dim_global_palm: int = 192,
+                 in_dim_global_vein: int = 192,
+                 in_dim_local_palm: int = 768,
+                 in_dim_local_vein: int = 768,
+                 out_dim_global: int = 256,
+                 out_dim_local: int = 256,
+                 use_spatial_fusion: bool = False,
+                 final_l2norm: bool = True,
+                 with_arcface: bool = False,
+                 num_classes: int = 0,
+                 arcface_s: float = 64.0,
+                 arcface_m: float = 0.50):
         super().__init__()
 
-        self.global_blocks = nn.ModuleList()
-        dim_a = dim_b = vit_dim
-        for _ in range(depth):
-            self.global_blocks.append(
-                CrossFusionBlock(dim_a, dim_b, fusion_dim, num_heads=num_heads, dropout=dropout)
-            )
-            dim_a = dim_b = fusion_dim
+        self.use_spatial_fusion = use_spatial_fusion
 
-        self.local_blocks = nn.ModuleList()
-        dim_a = dim_b = cnn_dim
-        for _ in range(depth):
-            self.local_blocks.append(
-                CrossFusionBlock(dim_a, dim_b, fusion_dim, num_heads=num_heads, dropout=dropout)
-            )
-            dim_a = dim_b = fusion_dim
+        # 1) 全局特征对齐（向量 -> 向量）
+        self.g_align_palm = FeatureAlign(in_dim_global_palm, out_dim_global, use_bn=False)
+        self.g_align_vein = FeatureAlign(in_dim_global_vein, out_dim_global, use_bn=False)
 
-        self.global_merge = nn.Sequential(
-            nn.Conv2d(fusion_dim * 2, fusion_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(fusion_dim),
-            nn.GELU(),
-        )
-        self.local_merge = nn.Sequential(
-            nn.Conv2d(fusion_dim * 2, fusion_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(fusion_dim),
-            nn.GELU(),
-        )
-        self.out_bn = nn.BatchNorm2d(fusion_dim * 2)
-        self.out_conv = nn.Conv2d(fusion_dim * 2, fusion_dim * 2, kernel_size=1)
+        # 2) 局部特征对齐：根据是否使用空间融合选择不同的对齐方式
+        if use_spatial_fusion:
+            # 空间特征融合：用卷积对齐通道数
+            self.l_align_palm = ConvAlign2d(in_dim_local_palm, out_dim_local, use_bn=True)
+            self.l_align_vein = ConvAlign2d(in_dim_local_vein, out_dim_local, use_bn=True)
+            self.l_fuse = SpatialAttentionFusion(out_dim_local, reduction=16)
+        else:
+            # 向量特征融合：用全连接对齐维度
+            self.l_align_palm = FeatureAlign(in_dim_local_palm, out_dim_local, use_bn=False)
+            self.l_align_vein = FeatureAlign(in_dim_local_vein, out_dim_local, use_bn=False)
+            self.l_fuse = PairwiseChannelAttentionFusion(dim=out_dim_local, reduction=4, dropout=0.0)
+
+        # 3) 全局特征融合（通道注意力）
+        self.g_fuse = PairwiseChannelAttentionFusion(dim=out_dim_global, reduction=4, dropout=0.0)
+
+        # 4) 输出拼接 + 规范化
+        self.final_dim = out_dim_global + out_dim_local
+        self.final_l2norm = final_l2norm
+
+        # 5) （可选）ArcFace 头
+        self.with_arcface = with_arcface
+        if with_arcface:
+            assert num_classes > 0, "with_arcface=True 时必须指定 num_classes"
+            self.arcface = ArcMarginProduct(self.final_dim, num_classes,
+                                            s=arcface_s, m=arcface_m)
+
+    @staticmethod
+    def _l2(x):
+        return F.normalize(x, dim=1)
+
+    def forward_features(self,
+                         palm_global: torch.Tensor, vein_global: torch.Tensor,
+                         palm_local:  torch.Tensor, vein_local:  torch.Tensor):
+        """
+        输入：
+            palm_global, vein_global: (N, C_g) 全局向量
+            palm_local, vein_local:
+                - 若 use_spatial_fusion=False: (N, C_l) 向量
+                - 若 use_spatial_fusion=True: (N, C_l, H, W) 空间特征图
+        返回：
+            fused_feat: (N, out_dim_global + out_dim_local)
+            details: 字典，包含中间权重/中间向量，便于可视化与消融
+        """
+        # ---- 1) 全局特征对齐与融合
+        g_p = self.g_align_palm(palm_global)  # (N, G)
+        g_v = self.g_align_vein(vein_global)  # (N, G)
+        g_fused, (g_wa, g_wb) = self.g_fuse(g_p, g_v)  # (N, G)
+
+        # ---- 2) 局部特征对齐与融合
+        if self.use_spatial_fusion:
+            # 空间特征融合
+            l_p = self.l_align_palm(palm_local)  # (N, L, H, W)
+            l_v = self.l_align_vein(vein_local)  # (N, L, H, W)
+            l_fused_spatial, (l_wa, l_wb) = self.l_fuse(l_p, l_v)  # (N, L, H, W)
+            # 池化为向量
+            l_fused = F.adaptive_avg_pool2d(l_fused_spatial, 1).flatten(1)  # (N, L)
+        else:
+            # 向量特征融合
+            l_p = self.l_align_palm(palm_local)   # (N, L)
+            l_v = self.l_align_vein(vein_local)   # (N, L)
+            l_fused, (l_wa, l_wb) = self.l_fuse(l_p, l_v)  # (N, L)
+
+        # ---- 3) 拼接全局和局部融合特征
+        fused_feat = torch.cat([g_fused, l_fused], dim=1)  # (N, G+L)
+        if self.final_l2norm:
+            fused_feat = self._l2(fused_feat)
+
+        # 便于排查/可视化
+        details = {
+            "global": {"palm": g_p, "vein": g_v, "fused": g_fused, "w_palm": g_wa, "w_vein": g_wb},
+            "local":  {"palm": l_p, "vein": l_v, "fused": l_fused, "w_palm": l_wa, "w_vein": l_wb},
+        }
+        return fused_feat, details
 
     def forward(self,
-                vit_palm: torch.Tensor,
-                vit_vein: torch.Tensor,
-                cnn_palm: torch.Tensor,
-                cnn_vein: torch.Tensor):
-        # 全局分支（ViT）
-        g_palm, g_vein = vit_palm, vit_vein
-        for block in self.global_blocks:
-            g_palm, g_vein = block(g_palm, g_vein)
-
-        # 细节分支（CNN）
-        l_palm, l_vein = cnn_palm, cnn_vein
-        for block in self.local_blocks:
-            l_palm, l_vein = block(l_palm, l_vein)
-
-        global_fused = self._merge_pair(g_palm, g_vein, self.global_merge)
-        local_fused = self._merge_pair(l_palm, l_vein, self.local_merge)
-        local_fused = _match_spatial(local_fused, global_fused)
-
-        fused_all = torch.cat([global_fused, local_fused], dim=1)
-        fused_all = self.out_bn(self.out_conv(fused_all))
-        return global_fused, local_fused, fused_all
-
-    def _merge_pair(self, feat_a: torch.Tensor, feat_b: torch.Tensor, projector: nn.Module):
-        feat_a = _ensure_rank4(feat_a)
-        feat_b = _ensure_rank4(feat_b)
-        feat_b = _match_spatial(feat_b, feat_a)
-        fused = torch.cat([feat_a, feat_b], dim=1)
-        return projector(fused)
-
-
-__all__ = ["Stage2Fusion", "CrossFusionBlock", "CrossAttentionUnit"]
+                palm_global: torch.Tensor, vein_global: torch.Tensor,
+                palm_local:  torch.Tensor, vein_local:  torch.Tensor,
+                labels: torch.Tensor = None):
+        fused_feat, details = self.forward_features(palm_global, vein_global,
+                                                    palm_local, vein_local)
+        if self.with_arcface:
+            assert labels is not None, "使用 ArcFace 前向时需要 labels"
+            logits = self.arcface(fused_feat, labels)
+            return logits, fused_feat, details
+        else:
+            return fused_feat, details
