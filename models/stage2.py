@@ -4,13 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# -------------------------------
-# 工具：特征对齐（Linear -> same dim）
-# -------------------------------
+# ---------------------------------------------------------
+# 特征对齐模块
+# ---------------------------------------------------------
 class FeatureAlign(nn.Module):
-    """
-    将输入向量线性投影到统一维度，便于注意力/加法/拼接。
-    """
+    """将输入向量线性投影到统一维度"""
     def __init__(self, in_dim: int, out_dim: int, use_bn: bool = False):
         super().__init__()
         self.fc = nn.Linear(in_dim, out_dim, bias=not use_bn)
@@ -26,45 +24,14 @@ class FeatureAlign(nn.Module):
         return x
 
 
-# ---------------------------------------------------------
-# 空间注意力：对两个空间特征图使用空间注意力进行自适应融合
-# ---------------------------------------------------------
-class SpatialAttentionFusion(nn.Module):
-    """
-    对两个空间特征图使用空间注意力进行自适应融合。
-    输入：两路同尺寸特征图 a, b (N, C, H, W)；输出同尺寸 (N, C, H, W)。
-    """
-    def __init__(self, in_channels: int, reduction: int = 16):
-        super().__init__()
-        hid = max(in_channels // reduction, 8)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels * 2, hid, 1, bias=False),
-            nn.BatchNorm2d(hid),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hid, 2, 1, bias=True)  # 2 路权重
-        )
-
-    def forward(self, a: torch.Tensor, b: torch.Tensor):
-        assert a.shape == b.shape, "SpatialAttentionFusion: a/b 尺寸必须一致"
-        x = torch.cat([a, b], dim=1)              # (N, 2C, H, W)
-        logits = self.conv(x)                      # (N, 2, H, W)
-        weights = F.softmax(logits, dim=1)         # 在 2 路上做 softmax
-        w_a, w_b = weights[:, 0:1], weights[:, 1:2]
-        fused = w_a * a + w_b * b
-        return fused, (w_a, w_b)
-
-
 class ConvAlign2d(nn.Module):
-    """
-    1x1 卷积 + BN：将通道数对齐到目标维度，用于空间特征图对齐。
-    """
+    """1x1卷积+BN：用于空间特征图对齐"""
     def __init__(self, in_ch: int, out_ch: int, use_bn: bool = True):
         super().__init__()
         layers = [nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=not use_bn)]
         if use_bn:
             layers.append(nn.BatchNorm2d(out_ch))
         self.proj = nn.Sequential(*layers)
-        # init
         for m in self.proj:
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
@@ -73,6 +40,95 @@ class ConvAlign2d(nn.Module):
 
     def forward(self, x):
         return self.proj(x)
+
+
+# ---------------------------------------------------------
+# 跨模态注意力（Cross-Modal Attention）- 图片架构
+# ---------------------------------------------------------
+class CrossModalAttention(nn.Module):
+    """
+    跨模态注意力机制：
+    - palm 生成 Query，vein 生成 Key & Value
+    - vein 生成 Query，palm 生成 Key & Value
+    - 允许两个模态相互查询和交互
+
+    输入：两路同维度向量 (N, dim)
+    输出：交互后的两路向量 (N, dim)×2
+    """
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim * num_heads == dim, "dim 必须能被 num_heads 整除"
+
+        self.scale = self.head_dim ** -0.5
+
+        # Q, K, V 投影层
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+
+        # 输出投影
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+
+        # Layer Norm
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        # 前馈网络（可选，增强表达能力）
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 2, dim)
+        )
+
+    def forward(self, palm: torch.Tensor, vein: torch.Tensor):
+        """
+        Args:
+            palm: (N, dim) 掌纹特征
+            vein: (N, dim) 掌静脉特征
+        Returns:
+            palm_enhanced: (N, dim) 交互后的掌纹特征
+            vein_enhanced: (N, dim) 交互后的掌静脉特征
+        """
+        B, D = palm.shape
+
+        # ===== Palm 查询 Vein =====
+        # Palm 作为 Q，Vein 作为 K, V
+        q_palm = self.q_proj(palm).view(B, self.num_heads, self.head_dim)  # (B, H, D/H)
+        k_vein = self.k_proj(vein).view(B, self.num_heads, self.head_dim)  # (B, H, D/H)
+        v_vein = self.v_proj(vein).view(B, self.num_heads, self.head_dim)  # (B, H, D/H)
+
+        # Attention: palm 从 vein 中提取信息
+        attn_palm = (q_palm * k_vein).sum(dim=-1, keepdim=True) * self.scale  # (B, H, 1)
+        attn_palm = F.softmax(attn_palm, dim=1)  # 归一化
+        palm_from_vein = (attn_palm * v_vein).view(B, -1)  # (B, D)
+
+        # 残差连接 + Layer Norm
+        palm_enhanced = self.norm1(palm + self.dropout(self.out_proj(palm_from_vein)))
+
+        # ===== Vein 查询 Palm =====
+        # Vein 作为 Q，Palm 作为 K, V
+        q_vein = self.q_proj(vein).view(B, self.num_heads, self.head_dim)
+        k_palm = self.k_proj(palm).view(B, self.num_heads, self.head_dim)
+        v_palm = self.v_proj(palm).view(B, self.num_heads, self.head_dim)
+
+        # Attention: vein 从 palm 中提取信息
+        attn_vein = (q_vein * k_palm).sum(dim=-1, keepdim=True) * self.scale  # (B, H, 1)
+        attn_vein = F.softmax(attn_vein, dim=1)
+        vein_from_palm = (attn_vein * v_palm).view(B, -1)  # (B, D)
+
+        # 残差连接 + Layer Norm
+        vein_enhanced = self.norm1(vein + self.dropout(self.out_proj(vein_from_palm)))
+
+        # 前馈网络增强
+        palm_enhanced = self.norm2(palm_enhanced + self.ffn(palm_enhanced))
+        vein_enhanced = self.norm2(vein_enhanced + self.ffn(vein_enhanced))
+
+        return palm_enhanced, vein_enhanced
 
 
 # ---------------------------------------------------------
@@ -207,21 +263,37 @@ class Stage2FusionCA(nn.Module):
             # 空间特征融合：用卷积对齐通道数
             self.l_align_palm = ConvAlign2d(in_dim_local_palm, out_dim_local, use_bn=True)
             self.l_align_vein = ConvAlign2d(in_dim_local_vein, out_dim_local, use_bn=True)
-            self.l_fuse = SpatialAttentionFusion(out_dim_local, reduction=16)
         else:
             # 向量特征融合：用全连接对齐维度
             self.l_align_palm = FeatureAlign(in_dim_local_palm, out_dim_local, use_bn=False)
             self.l_align_vein = FeatureAlign(in_dim_local_vein, out_dim_local, use_bn=False)
-            self.l_fuse = PairwiseChannelAttentionFusion(dim=out_dim_local, reduction=4, dropout=0.0)
 
-        # 3) 全局特征融合（通道注意力）
-        self.g_fuse = PairwiseChannelAttentionFusion(dim=out_dim_global, reduction=4, dropout=0.0)
+        # 局部特征的跨模态交互（CrossModalAttention）- 用于向量特征
+        self.l_cross_attn = CrossModalAttention(
+            dim=out_dim_local,
+            num_heads=8,
+            dropout=0.1
+        )
 
-        # 4) 输出拼接 + 规范化
+        # 3) 全局特征跨模态交互（CrossModalAttention）
+        self.g_cross_attn = CrossModalAttention(
+            dim=out_dim_global,
+            num_heads=8,
+            dropout=0.1
+        )
+
+        # 4) 全局特征融合模块（通道注意力）
+        self.g_fuse = PairwiseChannelAttentionFusion(dim=out_dim_global, reduction=4, dropout=0.1)
+
+        # 5) 局部特征融合模块（通道注意力）
+        self.l_fuse = PairwiseChannelAttentionFusion(dim=out_dim_local, reduction=4, dropout=0.1)
+
+        # 6) 输出拼接 + 规范化
+        # 融合后：全局维度 + 局部维度
         self.final_dim = out_dim_global + out_dim_local
         self.final_l2norm = final_l2norm
 
-        # 5) （可选）ArcFace 头
+        # 7) （可选）ArcFace 头
         self.with_arcface = with_arcface
         if with_arcface:
             assert num_classes > 0, "with_arcface=True 时必须指定 num_classes"
@@ -242,37 +314,53 @@ class Stage2FusionCA(nn.Module):
                 - 若 use_spatial_fusion=False: (N, C_l) 向量
                 - 若 use_spatial_fusion=True: (N, C_l, H, W) 空间特征图
         返回：
-            fused_feat: (N, out_dim_global + out_dim_local)
+            fused_feat: (N, out_dim_global + out_dim_local) - 拼接后的融合向量
             details: 字典，包含中间权重/中间向量，便于可视化与消融
         """
-        # ---- 1) 全局特征对齐与融合
+        # ---- 1) 全局特征对齐
         g_p = self.g_align_palm(palm_global)  # (N, G)
         g_v = self.g_align_vein(vein_global)  # (N, G)
-        g_fused, (g_wa, g_wb) = self.g_fuse(g_p, g_v)  # (N, G)
 
-        # ---- 2) 局部特征对齐与融合
+        # ---- 2) 全局特征通过跨模态注意力交互后融合
+        g_p_enhanced, g_v_enhanced = self.g_cross_attn(g_p, g_v)  # (N, G), (N, G)
+        # 使用通道注意力机制融合两个增强后的全局特征
+        g_fused, (g_wa, g_wb) = self.g_fuse(g_p_enhanced, g_v_enhanced)  # (N, G)
+
+        # ---- 3) 局部特征对齐与处理
         if self.use_spatial_fusion:
-            # 空间特征融合
+            # 空间特征融合路径
             l_p = self.l_align_palm(palm_local)  # (N, L, H, W)
             l_v = self.l_align_vein(vein_local)  # (N, L, H, W)
-            l_fused_spatial, (l_wa, l_wb) = self.l_fuse(l_p, l_v)  # (N, L, H, W)
-            # 池化为向量
-            l_fused = F.adaptive_avg_pool2d(l_fused_spatial, 1).flatten(1)  # (N, L)
+            # 池化为向量后进行跨模态交互
+            l_p_vec = F.adaptive_avg_pool2d(l_p, 1).flatten(1)  # (N, L)
+            l_v_vec = F.adaptive_avg_pool2d(l_v, 1).flatten(1)  # (N, L)
+            l_p_enhanced, l_v_enhanced = self.l_cross_attn(l_p_vec, l_v_vec)  # (N, L), (N, L)
         else:
-            # 向量特征融合
+            # 向量特征融合路径
             l_p = self.l_align_palm(palm_local)   # (N, L)
             l_v = self.l_align_vein(vein_local)   # (N, L)
-            l_fused, (l_wa, l_wb) = self.l_fuse(l_p, l_v)  # (N, L)
+            # 局部特征跨模态交互（CrossModalAttention）
+            l_p_enhanced, l_v_enhanced = self.l_cross_attn(l_p, l_v)  # (N, L), (N, L)
 
-        # ---- 3) 拼接全局和局部融合特征
+        # ---- 4) 局部特征通过通道注意力融合
+        l_fused, (l_wa, l_wb) = self.l_fuse(l_p_enhanced, l_v_enhanced)  # (N, L)
+
+        # ---- 5) 拼接融合后的全局特征和局部特征
         fused_feat = torch.cat([g_fused, l_fused], dim=1)  # (N, G+L)
+
         if self.final_l2norm:
             fused_feat = self._l2(fused_feat)
 
         # 便于排查/可视化
         details = {
-            "global": {"palm": g_p, "vein": g_v, "fused": g_fused, "w_palm": g_wa, "w_vein": g_wb},
-            "local":  {"palm": l_p, "vein": l_v, "fused": l_fused, "w_palm": l_wa, "w_vein": l_wb},
+            "global": {"palm": g_p, "vein": g_v, "palm_enhanced": g_p_enhanced,
+                       "vein_enhanced": g_v_enhanced, "fused": g_fused,
+                       "w_palm": g_wa, "w_vein": g_wb},
+            "local":  {"palm": l_p if not self.use_spatial_fusion else l_p_vec,
+                       "vein": l_v if not self.use_spatial_fusion else l_v_vec,
+                       "palm_enhanced": l_p_enhanced, "vein_enhanced": l_v_enhanced,
+                       "fused": l_fused, "w_palm": l_wa, "w_vein": l_wb},
+            "final_fused": fused_feat
         }
         return fused_feat, details
 

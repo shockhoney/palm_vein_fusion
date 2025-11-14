@@ -44,6 +44,90 @@ class TripletLoss(nn.Module):
         return triplet_loss, dist_ap.mean(), dist_an.mean()
 
 
+class IdentityLoss(nn.Module):
+    """
+    Identity Loss - 用于 Stage1
+    通过简单的分类任务增强特征的判别性
+    """
+    def __init__(self, feat_dim, num_classes, s=16.0):
+        super(IdentityLoss, self).__init__()
+        self.feat_dim = feat_dim
+        self.num_classes = num_classes
+        self.s = s
+        self.weight = nn.Parameter(torch.FloatTensor(num_classes, feat_dim))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, features, labels):
+        """
+        Args:
+            features: (N, feat_dim) 特征向量
+            labels: (N,) 类别标签
+        """
+        # L2 归一化
+        features_norm = F.normalize(features, dim=1)
+        weight_norm = F.normalize(self.weight, dim=0)
+
+        # 计算余弦相似度并缩放
+        logits = F.linear(features_norm, weight_norm) * self.s
+
+        # 交叉熵损失
+        loss = F.cross_entropy(logits, labels)
+        return loss, logits
+
+
+class Stage1Loss(nn.Module):
+    """
+    Stage1 完整损失：Triplet Loss + Identity Loss
+    根据论文图片设计
+    """
+    def __init__(self, feat_dim, num_classes,
+                 triplet_margin=0.5,
+                 triplet_mining='hard',
+                 w_triplet=1.0,
+                 w_identity=0.5,
+                 identity_s=16.0):
+        super(Stage1Loss, self).__init__()
+        self.w_triplet = w_triplet
+        self.w_identity = w_identity
+
+        self.triplet_loss = TripletLoss(margin=triplet_margin, mining=triplet_mining)
+        self.identity_loss = IdentityLoss(feat_dim, num_classes, s=identity_s)
+
+    def forward(self, feat_anchor, feat_positive, feat_negative, labels):
+        """
+        Args:
+            feat_anchor: (N, feat_dim) anchor特征
+            feat_positive: (N, feat_dim) positive特征
+            feat_negative: (N, feat_dim) negative特征
+            labels: (N,) anchor的类别标签
+        Returns:
+            total_loss: 总损失
+            loss_dict: 各项损失的字典
+        """
+        loss_dict = {}
+
+        # 1. Triplet Loss
+        triplet_loss, dist_ap, dist_an = self.triplet_loss(feat_anchor, feat_positive, feat_negative)
+        loss_dict['triplet'] = triplet_loss.item()
+        loss_dict['dist_ap'] = dist_ap.item()
+        loss_dict['dist_an'] = dist_an.item()
+
+        # 2. Identity Loss（仅对 anchor 计算）
+        identity_loss, logits = self.identity_loss(feat_anchor, labels)
+        loss_dict['identity'] = identity_loss.item()
+
+        # 计算分类准确率
+        _, pred = torch.max(logits, 1)
+        acc = (pred == labels).float().mean()
+        loss_dict['identity_acc'] = acc.item()
+
+        # 总损失
+        total_loss = self.w_triplet * triplet_loss + self.w_identity * identity_loss
+        loss_dict['total'] = total_loss.item()
+
+        return total_loss, loss_dict
+
+
 # ====================================================================================
 # 第二阶段：多任务损失（适配 Stage2FusionCA）
 # ====================================================================================
@@ -281,15 +365,31 @@ class Stage2FusionLoss(nn.Module):
 # 便捷函数：创建推荐的损失函数
 # ====================================================================================
 
-def get_stage1_loss(margin=0.5, mining='hard'):
+def get_stage1_loss(feat_dim, num_classes,
+                    triplet_margin=0.5, triplet_mining='hard',
+                    w_triplet=1.0, w_identity=0.5,
+                    identity_s=16.0):
     """
-    获取 Stage1 推荐损失函数（Triplet Loss）
+    获取 Stage1 推荐损失函数（Triplet Loss + Identity Loss）
 
     Args:
-        margin: Triplet margin（建议 0.3-1.0）
-        mining: 困难样本挖掘策略 ('none', 'hard')
+        feat_dim: 特征维度（ViT: 192, CNN: 768）
+        num_classes: 类别数（用于 Identity Loss）
+        triplet_margin: Triplet margin（建议 0.3-1.0）
+        triplet_mining: 困难样本挖掘策略 ('none', 'hard')
+        w_triplet: Triplet Loss权重
+        w_identity: Identity Loss权重
+        identity_s: Identity Loss的缩放因子
     """
-    return TripletLoss(margin=margin, mining=mining)
+    return Stage1Loss(
+        feat_dim=feat_dim,
+        num_classes=num_classes,
+        triplet_margin=triplet_margin,
+        triplet_mining=triplet_mining,
+        w_triplet=w_triplet,
+        w_identity=w_identity,
+        identity_s=identity_s
+    )
 
 
 def get_stage2_loss(num_classes, feat_dim=512, mode='standard'):
